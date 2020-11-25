@@ -4,8 +4,7 @@
 
         -SharePoint Site
         -Azure AD App Registration
-        -Azure Automation Account & Runbooks
-        -Logic App
+        -Logic Apps
 
 .DESCRIPTION
     Deploys the Teams Automate solution (excluding the PowerApp and Flows).
@@ -52,9 +51,13 @@
 .PARAMETER IsEdu
     Specifies whether the current tenant is an Education tenant. If set to true, the Education Teams Templates will be deployed. These will be skipped if set to false or left blank.
 
+.PARAMETER KeyVaultName
+    Name for the Key Vault that will be provisioned to store the Azure ad app ID and secret. The Key Vault name must be unique and not exist in another subscription.
+
+
 .EXAMPLE
     deploy.ps1 -TenantName "contoso" -RequestsSiteName "Teams Request" -RequestsSiteDesc "Site to Microsoft Teams requests" 
-    -ManagedPath "sites" -SubscriptionId "acb9bcbb-1f4b-44b9-960c-7ddaf4ad21d2" -Location "uksouth" -ResourceGroupName "teamsautomate-rg" -AppName "TeamsAutomate" -ServiceAccountUPN provisioning@contoso.com -UseMSGraphBeta $false -IsEdu $false
+    -ManagedPath "sites" -SubscriptionId "acb9bcbb-1f4b-44b9-960c-7ddaf4ad21d2" -Location "uksouth" -ResourceGroupName "teamsautomate-rg" -AppName "TeamsAutomate" -ServiceAccountUPN provisioning@contoso.com -UseMSGraphBeta $false -IsEdu $false -KeyValueName "teamsautomate-kv"
 
 -----------------------------------------------------------------------------------------------------------------------------------
 Script name : deploy.ps1
@@ -175,9 +178,14 @@ Param(
     $UseMSGraphBeta = $false,
 
     [Parameter(Mandatory = $false,
-    ValueFromPipeline = $true)]
+        ValueFromPipeline = $true)]
     [Bool]
-    $IsEdu = $false
+    $IsEdu = $false,
+
+    [Parameter(Mandatory = $true,
+        ValueFromPipeline = $true)]
+    [String]
+    $KeyVaultName = $false
 )
 
 Add-Type -AssemblyName System.Web
@@ -190,7 +198,7 @@ If (-not (Test-Path -Path "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2")) {
 
 # Install required modules
 Install-Module microsoft.online.sharepoint.powershell -Scope CurrentUser
-Install-Module SharePointPnPPowerShellOnline -Scope CurrentUser -MinimumVersion 3.19.2003.0 -Force
+Install-Module SharePointPnPPowerShellOnline -Scope CurrentUser -MaximumVersion 3.23.2007.1 -Force
 Install-Module ImportExcel -Scope CurrentUser
 Install-Module Az -AllowClobber -Scope CurrentUser
 Install-Module AzureADPreview -Scope CurrentUser
@@ -221,9 +229,6 @@ $tenantAdminUrl = "https://$tenantName-admin.sharepoint.com"
 $requestsSiteAlias = $RequestsSiteName -replace (' ', '')
 $requestsSiteUrl = "https://$tenantName.sharepoint.com/$ManagedPath/$requestsSiteAlias"
 
-# Automation account settings
-$automationAccountName = "teamsautomate-auto"
-
 # API connection names
 $spoConnectionName = "teamsautomate-spo"
 $o365OutlookConnectionName = "teamsautomate-o365outlook"
@@ -233,43 +238,88 @@ $teamsConnectionName = "teamsautomate-teams"
 # Global variables
 $global:context = $null
 $global:requestsListId = $null
-$global:requestsSetingsListId = $null
 $global:teamsTemplatesListId = $null
 $global:appId = $null
 $global:appSecret = $null
 $global:appServicePrincipalId = $null
 $global:siteClassifications = $null
+$global:location = $null
+
+    # Test for availability of Azure resources
+    function Test-AzNameAvailability {
+        param(
+            [Parameter(Mandatory = $true)] [string] $AuthorizationToken,
+            [Parameter(Mandatory = $true)] [string] $SubscriptionId,
+            [Parameter(Mandatory = $true)] [string] $Name,
+            [Parameter(Mandatory = $true)] [ValidateSet(
+                'ApiManagement', 'KeyVault', 'ManagementGroup', 'Sql', 'StorageAccount', 'WebApp')]
+            $ServiceType
+        )
+ 
+        $uriByServiceType = @{
+            ApiManagement   = 'https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.ApiManagement/checkNameAvailability?api-version=2019-01-01'
+            KeyVault        = 'https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.KeyVault/checkNameAvailability?api-version=2019-09-01'
+            ManagementGroup = 'https://management.azure.com/providers/Microsoft.Management/checkNameAvailability?api-version=2018-03-01-preview'
+            Sql             = 'https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Sql/checkNameAvailability?api-version=2018-06-01-preview'
+            StorageAccount  = 'https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Storage/checkNameAvailability?api-version=2019-06-01'
+            WebApp          = 'https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Web/checkNameAvailability?api-version=2019-08-01'
+        }
+ 
+        $typeByServiceType = @{
+            ApiManagement   = 'Microsoft.ApiManagement/service'
+            KeyVault        = 'Microsoft.KeyVault/vaults'
+            ManagementGroup = '/providers/Microsoft.Management/managementGroups'
+            Sql             = 'Microsoft.Sql/servers'
+            StorageAccount  = 'Microsoft.Storage/storageAccounts'
+            WebApp          = 'Microsoft.Web/sites'
+        }
+ 
+        $uri = $uriByServiceType[$ServiceType] -replace ([regex]::Escape('{subscriptionId}')), $SubscriptionId
+        $body = '"name": "{0}", "type": "{1}"' -f $Name, $typeByServiceType[$ServiceType]
+ 
+        $response = (Invoke-WebRequest -Uri $uri -Method Post -Body "{$body}" -ContentType "application/json" -Headers @{Authorization = $AuthorizationToken }).content
+        $response | ConvertFrom-Json |
+        Select-Object @{N = 'Name'; E = { $Name } }, @{N = 'Type'; E = { $ServiceType } }, @{N = 'Available'; E = { $_ | Select-Object -ExpandProperty *available } }, Reason, Message
+    }
+
+    # Get Azure access token for current user
+    function Get-AccessTokenFromCurrentUser {
+        $azContext = Get-AzContext
+        $azProfile = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureRmProfileProvider]::Instance.Profile
+        $profileClient = New-Object -TypeName Microsoft.Azure.Commands.ResourceManager.Common.RMProfileClient -ArgumentList $azProfile
+        $token = $profileClient.AcquireAccessToken($azContext.Subscription.TenantId)
+        ('Bearer ' + $token.AccessToken)
+    }        
 
 # Create site and apply provisioning template
 function CreateRequestsSharePointSite {
-    try {
+     try {
+
         Write-Host "### TEAMS REQUESTS SITE CREATION ###`nCreating Teams Requests SharePoint site..." -ForegroundColor Yellow
 
-        $site = Get-PnPTenantSite -Url $requestsSiteUrl -ErrorAction SilentlyContinue
+    $site = Get-PnPTenantSite -Url $requestsSiteUrl -ErrorAction SilentlyContinue
 
-        if (!$site) {
+    if (!$site) {
 
-                # Site will be created with current user connected to PnP as the owner/primary admin
-                New-PnPSite -Type TeamSite -Title $RequestsSiteName -Alias $requestsSiteAlias -Description $RequestsSiteDesc
+        # Site will be created with current user connected to PnP as the owner/primary admin
+        New-PnPSite -Type TeamSite -Title $RequestsSiteName -Alias $requestsSiteAlias -Description $RequestsSiteDesc
 
-                Write-Host "Site created`n**TEAMS REQUESTS SITE CREATION COMPLETE**" -ForegroundColor Green
-            }
-        
-            
+        Write-Host "Site created`n**TEAMS REQUESTS SITE CREATION COMPLETE**" -ForegroundColor Green
+    }         
 
-        else {
-            Write-Host "Site already exists! Do you wish to overwrite?" -ForegroundColor Red
-            $overwrite = Read-Host " ( y (overwrite) / n (exit) )"
-            if ($overwrite -ne "y") {
-                break
-            }
-            
+    else {
+        Write-Host "Site already exists! Do you wish to overwrite?" -ForegroundColor Red
+        $overwrite = Read-Host " ( y (overwrite) / n (exit) )"
+        if ($overwrite -ne "y") {
+            break
         }
+            
     }
-    catch {
-        $errorMessage = $_.Exception.Message
-        Write-Host "Error occured while creating of the SharePoint site: $errorMessage" -ForegroundColor Red
-    }
+}
+catch {
+    $errorMessage = $_.Exception.Message
+    Write-Host "Error occured while creating of the SharePoint site: $errorMessage" -ForegroundColor Red
+}
 }
 
 # Configure the new site
@@ -355,21 +405,21 @@ function ConfigureSharePointSite {
 
         $teamsTemplates = Import-Excel "$packageRootPath$settingsPath" -WorksheetName $teamsTemplatesWorksheetName
         foreach ($template in $teamsTemplates) {
-            If(!$isEdu -and ($template.BaseTemplateId -eq "educationStaff" -or $template.BaseTemplateId -eq "educationProfessionalLearningCommunity")) {
+            If (!$isEdu -and ($template.BaseTemplateId -eq "educationStaff" -or $template.BaseTemplateId -eq "educationProfessionalLearningCommunity")) {
                 # Tenant is not an EDU tenant  - do nothing
             }
-            else{
-            $listItemCreationInformation = New-Object Microsoft.SharePoint.Client.ListItemCreationInformation
-            $newItem = $teamsTemplatesList.AddItem($listItemCreationInformation)
-            $newItem["Title"] = $template.Title
-            $newItem["BaseTemplateType"] = $template.BaseTemplateType
-            $newItem["BaseTemplateId"] = $template.BaseTemplateId
-            $newItem["TeamId"] = $template.TeamId
-            $newItem["Description"] = $template.Description
-            $newItem["FirstPartyTemplate"] = $template.FirstPartyTemplate
-            $newItem["TeamVisibility"] = $template.TeamVisibility
-            $newitem.Update()
-            $context.ExecuteQuery()
+            else {
+                $listItemCreationInformation = New-Object Microsoft.SharePoint.Client.ListItemCreationInformation
+                $newItem = $teamsTemplatesList.AddItem($listItemCreationInformation)
+                $newItem["Title"] = $template.Title
+                $newItem["BaseTemplateType"] = $template.BaseTemplateType
+                $newItem["BaseTemplateId"] = $template.BaseTemplateId
+                $newItem["TeamId"] = $template.TeamId
+                $newItem["Description"] = $template.Description
+                $newItem["FirstPartyTemplate"] = $template.FirstPartyTemplate
+                $newItem["TeamVisibility"] = $template.TeamVisibility
+                $newitem.Update()
+                $context.ExecuteQuery()
             }
         }
         Write-Host "Added templates to Teams Templates list" -ForegroundColor Green
@@ -379,8 +429,7 @@ function ConfigureSharePointSite {
         # Check if service account already exists in the site (service account is the same user that is authenticated to PnP)
         $user = Get-PnPUser | Where-Object Email -eq $ServiceAccountUPN
 
-        if($null -eq $user)
-        {
+        if ($null -eq $user) {
             # Get owners group
             $group = Get-PnPGroup | Where-Object Title -Match "Owners"
             
@@ -399,29 +448,60 @@ function ConfigureSharePointSite {
 
 # Get configured site classifications
 function GetSiteClassifications {
-    $groupDirectorySetting = Get-AzureADDirectorySetting | Where-Object DisplayName -eq "Group.Unified"
+    $groupDirectorySetting = AzureADPreview\Get-AzureADDirectorySetting | Where-Object DisplayName -eq "Group.Unified"
     $classifications = $groupDirectorySetting.Values | Where-Object Name -eq "ClassificationList" | Select-Object Value
 
     $global:siteClassifications = $classifications.Value
 }
 
+# Gets the azure ad app
+function GetAzureADApp {
+    param ($appName)
+
+    $app = az ad app list --filter "displayName eq '$appName'" | ConvertFrom-Json
+
+    return $app
+
+}
+
 function CreateAzureADApp {
     try {
-        Write-Host "### AZURE AD APP CREATION ###`nCreating Azure AD App - '$appName'..." -ForegroundColor Yellow
-        
-        # Create azure ad app registration using CLI
-        az ad app create --display-name $appName --required-resource-accesses './manifest.json' --password $global:appSecret --end-date '2299-12-31T11:59:59+00:00'
+        Write-Host "### AZURE AD APP CREATION ###" -ForegroundColor Yellow
 
-        Write-Host "Waiting for app to finish creating..."
+        # Check if the app already exists - script has been previously executed
+        $app = GetAzureADApp $appName
 
-        Start-Sleep -s 60
+        if (-not ([string]::IsNullOrEmpty($app))) {
 
-        $secretExpiryDate = (Get-Date).AddYears(1)
-        Write-Host "Created Azure AD App`nCLIENT SECRET WILL EXPIRE ON - "$secretExpiryDate.ToString("dd/MM/yyyy") -ForegroundColor Green
+            # Update azure ad app registration using CLI
+            Write-Host "Azure AD App '$appName' already exists - updating existing app..." -ForegroundColor Yellow
 
-        $appRegistrationCollection = az ad app list --display-name $appName
-        $appRegistration = $appRegistrationCollection | ConvertFrom-Json
-        $global:appId = $appRegistration.appId
+            az ad app update --id $app.appId --required-resource-accesses './manifest.json' --password $global:appSecret
+
+            Write-Host "Waiting for app to finish updating..."
+
+            Start-Sleep -s 60
+
+            Write-Host "Updated Azure AD App" -ForegroundColor Green
+
+        } 
+        else {
+            # Create the app
+            Write-Host "Creating Azure AD App - '$appName'..." -ForegroundColor Yellow
+
+            # Create azure ad app registration using CLI
+            az ad app create --display-name $appName --required-resource-accesses './manifest.json' --password $global:appSecret --end-date '2299-12-31T11:59:59+00:00'
+
+            Write-Host "Waiting for app to finish creating..."
+
+            Start-Sleep -s 60
+            
+            Write-Host "Created Azure AD App" -ForegroundColor Green
+
+        }
+
+        $app = GetAzureADApp $appName
+        $global:appId = $app.appId
 
         Write-Host "Granting admin content for Microsoft Graph..." -ForegroundColor Yellow
 
@@ -445,46 +525,25 @@ function CreateAzureADApp {
     }
 }
 
-# Create automation account, import modules, deploy runbooks and configure access policies
-function DeployAutomationAssets {
-    try {
-        Write-Host "Creating and deploying automation assets..." -ForegroundColor Yellow
-        
-        New-AzAutomationAccount -Name $automationAccountName -Location $Location -ResourceGroupName $ResourceGroupName
+function CreateConfigureKeyVault {
+    Write-Host "Creating/Updating Key Vault and setting secrets..." -ForegroundColor Yellow
 
-        # TODO - Make content links into variables
-        # Import automation modules - wait for each module to import before continuing 
-        New-AzAutomationModule -AutomationAccountName $automationAccountName -Name "Az.Accounts" -ContentLink "https://devopsgallerystorage.blob.core.windows.net/packages/az.accounts.1.6.2.nupkg" -ResourceGroupName $ResourceGroupName
+    # Check if the key vault already exists
+    $keyVault = Get-AzKeyVault -Name $KeyVaultName
 
-        while ((Get-AzAutomationModule -Name "Az.Accounts" -ResourceGroupName $ResourceGroupName -AutomationAccountName $automationAccountName).ProvisioningState -eq "Creating") {
-            Start-Sleep -Seconds 30
-        }
-               
-        New-AzAutomationModule -AutomationAccountName $automationAccountName -Name "SharePointPnPPowerShellOnline" -ContentLink "https://devopsgallerystorage.blob.core.windows.net/packages/sharepointpnppowershellonline.3.12.1908.1.nupkg" -ResourceGroupName $ResourceGroupName
-
-        # Import automation runbooks
-        Import-AzAutomationRunbook -Name "CheckSiteExists" -Path "./runbooks/checksiteexists.ps1" `
-            -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName `
-            -Type PowerShell
-
-        # Publish runbooks
-        Publish-AzAutomationRunbook -Name "CheckSiteExists" -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName
-
-        # Create variables
-        New-AzAutomationVariable -AutomationAccountName $automationAccountName -Name "appClientId" -Encrypted $False -Value $global:appId -ResourceGroupName $ResourceGroupName
-        New-AzAutomationVariable -AutomationAccountName $automationAccountName -Name "appSecret" -Encrypted $true -Value $global:appSecret -ResourceGroupName $ResourceGroupName
-
-        # Create the role assignments
-        New-AzRoleAssignment -ObjectId $global:appServicePrincipalId -RoleDefinitionName "Automation Job Operator" -ResourceName $automationAccountName -ResourceType Microsoft.Automation/automationAccounts -ResourceGroupName $ResourceGroupName
-        New-AzRoleAssignment -ObjectId $global:appServicePrincipalId -RoleDefinitionName "Automation Runbook Operator" -ResourceName $automationAccountName -ResourceType Microsoft.Automation/automationAccounts -ResourceGroupName $ResourceGroupName
-        
-        Write-Host "Finished automation assets deployment" -ForegroundColor Green
-
+    if($null -eq $keyVault)
+    {
+    # Use the tenant name in the key vault name to ensure it is unique - first 8 characters only due to maximum allowed length of key vault names
+    $keyVault = New-AzKeyVault -Name $KeyVaultName -ResourceGroupName $ResourceGroupName -Location $Location
     }
-    catch {
-        $errorMessage = $_.Exception.Message
-        Write-Host "Error occured while deploying Azure resources: $errorMessage" -ForegroundColor Red
-    }
+
+    # Create/update the secrets for the ad app id and password
+    Set-AzKeyVaultSecret -VaultName $KeyVaultName -Name 'appid' -SecretValue (ConvertTo-SecureString -String $global:appId -AsPlainText -Force) | Out-Null
+    Set-AzKeyVaultSecret -VaultName $KeyVaultName -Name 'appsecret' -SecretValue (ConvertTo-SecureString -String $global:appSecret -AsPlainText -Force) | Out-Null
+
+    Set-AzKeyVaultAccessPolicy -VaultName $KeyVaultName -ObjectId $global:appServicePrincipalId -PermissionsToSecrets List,Get
+
+    Write-Host "Finished creating/updating Key Vault and setting secrets" -ForegroundColor Green
 
 }
 
@@ -493,19 +552,22 @@ function DeployARMTemplate {
     try { 
         # Deploy ARM templates
         Write-Host "Deploying api connections..." -ForegroundColor Yellow
-        az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'connections.json' --parameters "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "location=$location"
+        az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'connections.json' --parameters "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "location=$global:location" "keyvaultName=$KeyVaultName"
 
-        Write-Host "Deploying logic app..." -ForegroundColor Yellow
+        Write-Host "Deploying logic apps..." -ForegroundColor Yellow
+
+        az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'checksiteexists.json' --parameters "resourceGroupName=$resourceGroupName" "subscriptionId=$subscriptionId" "spoTenantName=$tenantName.sharepoint.com" "location=$location"
+  
 
         if ($UseMSGraphBeta) {
             Write-Host "Microsoft Graph beta endpoint will be used"
-            az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'processteamrequestbeta.json' --parameters "resourceGroupName=$resourceGroupName" "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "automationAccountName=$automationAccountName" "requestsSiteUrl=$requestsSiteUrl" "requestsListId=$global:requestsListId" "location=$location" "serviceAccountUPN=$ServiceAccountUPN"
+            az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'processteamrequestbeta.json' --parameters "resourceGroupName=$resourceGroupName" "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "requestsSiteUrl=$requestsSiteUrl" "requestsListId=$global:requestsListId" "location=$global:location" "serviceAccountUPN=$ServiceAccountUPN"
         }
         else {
-            az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'processteamrequestv1.0.json' --parameters "resourceGroupName=$resourceGroupName" "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "automationAccountName=$automationAccountName" "requestsSiteUrl=$requestsSiteUrl" "requestsListId=$global:requestsListId" "templatesListId=$global:teamsTemplatesListId" "location=$location" "serviceAccountUPN=$ServiceAccountUPN"
+            az deployment group create --resource-group $resourceGroupName --subscription $SubscriptionId --template-file 'processteamrequestv1.0.json' --parameters "resourceGroupName=$resourceGroupName" "subscriptionId=$subscriptionId" "tenantId=$TenantId" "appId=$global:appId" "appSecret=$global:appSecret" "requestsSiteUrl=$requestsSiteUrl" "requestsListId=$global:requestsListId" "templatesListId=$global:teamsTemplatesListId" "location=$global:location" "serviceAccountUPN=$ServiceAccountUPN"
         }
 
-        Write-Host "Finished deploying logic app" -ForegroundColor Green
+        Write-Host "Finished deploying logic apps" -ForegroundColor Green
     }
     catch {
         $errorMessage = $_.Exception.Message
@@ -532,7 +594,7 @@ function AuthoriseLogicAppConnection($resourceId) {
     $parameters = @{
         "parameters" = , @{
             "parameterName" = "token";
-            "redirectUrl"   = "https://ema1.exp.azure.com/ema/default/authredirect"
+            "redirectUrl"   = "http://localhost"
         }
     }
 
@@ -585,31 +647,68 @@ function AuthoriseLogicAppConnections() {
     Write-Host "### LOGIC APP CONNECTIONS AUTHORISATION COMPLETE ###" -ForegroundColor Green
 }
 
-function CreateRoleAssignments() {
-
-    Write-Host "### AZURE ROLE ASSIGNMENTS ###`nCreating Role Assignments..." -ForegroundColor Yellow
-
-    # Create the role assignments
-    New-AzRoleAssignment -ObjectId $global:appServicePrincipalId -RoleDefinitionName "Automation Job Operator" -ResourceName $automationAccountName -ResourceType Microsoft.Automation/automationAccounts -ResourceGroupName $ResourceGroupName
-    New-AzRoleAssignment -ObjectId $global:appServicePrincipalId -RoleDefinitionName "Automation Runbook Operator" -ResourceName $automationAccountName -ResourceType Microsoft.Automation/automationAccounts -ResourceGroupName $ResourceGroupName
-
-    Write-Host "Role assignments created`n### AZURE ROLE ASSIGNMENTS COMPLETE ###" -ForegroundColor Green
-
-}
-
-#Check that the provided location is a valid Azure location
+# Check that the provided location is a valid Azure location
 function ValidateAzureLocation {
     $locations = Get-AzLocation
     
-    $Location = $Location.Replace(" ","")
+    $global:location = $Location.Replace(" ", "").ToLower()
 
     # Validate that the location exists
-    if($null -eq ($locations | Where-Object Location -eq $Location)) {
+    if ($null -eq ($locations | Where-Object Location -eq $global:location)) {
         throw "Invalid Azure Location. Please provide a valid location. See this list - https://azure.microsoft.com/en-gb/global-infrastructure/locations/"
 
     }
 }
 
+# Check that the Key Vault does not already exist and ensure the name is valid
+function ValidateKeyVault {
+    Write-Host "Checking for availability of Key Vault..." -ForegroundColor Yellow
+
+    $availabilityResult = $null
+
+    $availabilityParams = @{
+        Name               = $KeyVaultName
+        ServiceType        = 'KeyVault'
+        AuthorizationToken = Get-AccessTokenFromCurrentUser
+        SubscriptionId     = $SubscriptionId
+    }
+    
+    $availabilityResult = Test-AzNameAvailability @availabilityParams
+
+    if ($availabilityResult.Available) {
+        Write-Host "Key Vault is available." -ForegroundColor Green
+    }
+
+    if ($availabilityResult.Reason -eq "AlreadyExists") {
+
+         #Check if the key vault exists in this subscription
+    $keyVault = Get-AzKeyVault -Name $KeyVaultName
+
+    if($null -ne $keyVault)
+    {
+        Write-Host "Key Vault already exists in this Azure subscription. Do you wish to use it?" -ForegroundColor Red
+        $update = Read-Host " ( y (yes) / n (exit) ) "
+        if ($update -ne "y")
+        {
+            Write-Host "Script terminated. Please specify a different Key Vault name or choose to use the existing Key Vault when re-executing the script." -ForegroundColor Red
+            break
+        }
+        else {
+            Write-Host "Existing Key Vault '$KeyVaultName' will be used." -ForegroundColor Yellow
+            
+        }   
+    }
+    else {
+        throw "Key Vault already exists in another Azure subscription. Please specify a different name."
+    }
+}
+
+if ($availabilityResult.reason -eq "Invalid") {
+    
+        throw $availabilityResult.message
+    } 
+
+}
 
 Write-Ascii -InputObject "Request-a-Team" -ForegroundColor Magenta
 
@@ -631,6 +730,7 @@ $global:encodedAppSecret = [System.Web.HttpUtility]::UrlEncode($global:appSecret
 # Initialise connections - Azure Az/CLI
 Write-Host "Launching Azure sign-in..." -ForegroundColor Yellow
 $azConnect = Connect-AzAccount -Subscription $SubscriptionId -Tenant $TenantId
+ValidateKeyVault
 ValidateAzureLocation
 Write-Host "Launching Azure AD sign-in..." -ForegroundColor Yellow
 Connect-AzureAD
@@ -655,10 +755,10 @@ Write-Host "### AZURE RESOURCES DEPLOYMENT ###`nStarting Azure resources deploym
 # Handle spaces in resource group name
 $ResourceGroupName = $ResourceGroupName.Replace(" ", "")
 Write-Host "Creating resource group $resourceGroupName..." -ForegroundColor Yellow
-New-AzResourceGroup -Name $resourceGroupName -Location $location
+New-AzResourceGroup -Name $resourceGroupName -Location $global:location
 Write-Host "Created resource group" -ForegroundColor Green
 
-DeployAutomationAssets
+CreateConfigureKeyVault
 DeployARMTemplate
 
 Write-Host "Azure resources deployed`n### AZURE RESOURCES DEPLOYMENT COMPLETE ###" -ForegroundColor Green
